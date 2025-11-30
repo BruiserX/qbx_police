@@ -1,6 +1,7 @@
 local config = require 'config.client'
 local sharedConfig = require 'config.shared'
-local currentGarage = 0
+local currentStation = nil -- Current station ID
+local currentGarage = 0 -- Current location index within station
 local inFingerprint = false
 local fingerprintSessionId = nil
 local inStash = false
@@ -9,6 +10,71 @@ local inHelicopter = false
 local inImpound = false
 local inGarage = false
 local inPrompt = false
+
+-- Station utility functions
+local function getStationById(stationId)
+    for _, station in ipairs(sharedConfig.stations) do
+        if station.id == stationId then
+            return station
+        end
+    end
+    return nil
+end
+
+local function getStationLocation(station, locationType, index)
+    if not station then return nil end
+    local locations = station[locationType]
+    if not locations or #locations == 0 then return nil end
+
+    if index then
+        return locations[index]
+    end
+
+    -- If no index specified, return the first location (for backwards compatibility)
+    return locations[1]
+end
+
+local function findStationForLocation(coords, locationType)
+    -- Find which station a location belongs to based on proximity
+    local nearestStation = nil
+    local nearestDistance = math.huge
+
+    for _, station in ipairs(sharedConfig.stations) do
+        local locations = station[locationType]
+        if locations then
+            for _, locationCoords in ipairs(locations) do
+                local locCoords = type(locationCoords) == 'vector3' and locationCoords or vec3(locationCoords.x, locationCoords.y, locationCoords.z)
+                local distance = #(coords - locCoords)
+                if distance < nearestDistance and distance < 5.0 then -- Within 5 units
+                    nearestDistance = distance
+                    nearestStation = station
+                end
+            end
+        end
+    end
+
+    return nearestStation
+end
+
+-- Check if player's job has access to this station
+local function hasStationAccess(station)
+    if not station then return false end
+
+    local playerJob = QBX.PlayerData.job
+    if not playerJob or playerJob.type ~= 'leo' then return false end
+
+    -- If station has no jobs restriction, allow all LEO jobs
+    if not station.jobs or #station.jobs == 0 then return true end
+
+    -- Check if player's job is in the allowed jobs list
+    for _, allowedJob in ipairs(station.jobs) do
+        if playerJob.name == allowedJob then
+            return true
+        end
+    end
+
+    return false
+end
 
 local function openFingerprintUi()
     SendNUIMessage({
@@ -79,8 +145,11 @@ local function doCarDamage(currentVehicle, veh)
 end
 
 local function takeOutImpound(vehicle)
-    if not inImpound then return end
-    local coords = sharedConfig.locations.impound[currentGarage]
+    if not inImpound or not currentStation then return end
+    local station = getStationById(currentStation)
+    if not station then return end
+
+    local coords = getStationLocation(station, 'impound', currentGarage)
     if not coords then return end
 
     local netId = lib.callback.await('qbx_policejob:server:spawnVehicle', false, vehicle.vehicle, coords, vehicle.plate, vehicle.id)
@@ -95,13 +164,16 @@ local function takeOutImpound(vehicle)
     lib.setVehicleProperties(veh, properties)
     SetVehicleFuelLevel(veh, vehicle.fuel)
     doCarDamage(veh, vehicle)
-    TriggerServerEvent('police:server:TakeOutImpound', vehicle.plate, currentGarage)
+    TriggerServerEvent('police:server:TakeOutImpound', vehicle.plate, currentStation, currentGarage)
     SetVehicleEngineOn(veh, true, true, false)
 end
 
 local function takeOutVehicle(vehicleInfo)
-    if not inGarage then return end
-    local coords = sharedConfig.locations.vehicle[currentGarage]
+    if not inGarage or not currentStation then return end
+    local station = getStationById(currentStation)
+    if not station then return end
+
+    local coords = getStationLocation(station, 'vehicle', currentGarage)
     if not coords then return end
     local pattern = ''
     for _ = 1, 8 - #sharedConfig.policePlatePrefix do
@@ -207,7 +279,13 @@ end
 
 local function openEvidenceMenu()
     local pos = GetEntityCoords(cache.ped)
-    for k, v in pairs(sharedConfig.locations.evidence) do
+    local station = findStationForLocation(pos, 'evidence')
+    if not station then return end
+
+    local locations = station.evidence
+    if not locations then return end
+
+    for k, v in ipairs(locations) do
         if #(pos - v) < 1 then
             openEvidenceLockerSelectInput(k)
             return
@@ -293,8 +371,10 @@ local function uiPrompt(promptType, id)
                     lib.hideTextUI()
                     break
                 elseif promptType == 'trash' then
-                    if not inTrash then return end
-                    exports.ox_inventory:openInventory('stash', ('policetrash_%s'):format(id))
+                    if not inTrash or not currentStation then return end
+                    local station = getStationById(currentStation)
+                    if not station then return end
+                    exports.ox_inventory:openInventory('stash', ('policetrash_%s_%s'):format(currentStation, id))
                     break
                 elseif promptType == 'stash' then
                     if not inStash then return end
@@ -431,153 +511,188 @@ end
 
 if config.useTarget then
     CreateThread(function()
-        for i = 1, #sharedConfig.locations.duty do
-            exports.ox_target:addBoxZone({
-                coords = sharedConfig.locations.duty[i],
-                size = vec3(1,1,3),
-                debug = config.polyDebug,
-                options = {{
-                    distance = 1.5,
-                    label = locale('info.onoff_duty'),
-                    icon = 'fa-solid fa-sign-in-alt',
-                    onSelect = ToggleDuty,
-                    groups = 'police'
-                }}
-            })
+        for _, station in ipairs(sharedConfig.stations) do
+            if station.duty then
+                for _, dutyCoords in ipairs(station.duty) do
+                    -- Use station jobs if specified, otherwise default to 'police' group
+                    local groups = station.jobs and station.jobs or {'police'}
+                    exports.ox_target:addBoxZone({
+                        coords = dutyCoords,
+                        size = vec3(1,1,3),
+                        debug = config.polyDebug,
+                        options = {{
+                            distance = 1.5,
+                            label = locale('info.onoff_duty'),
+                            icon = 'fa-solid fa-sign-in-alt',
+                            onSelect = function()
+                                if not hasStationAccess(station) then
+                                    return exports.qbx_core:Notify(locale('error.no_access') or 'You do not have access to this station', 'error')
+                                end
+                                ToggleDuty()
+                            end,
+                            groups = groups
+                        }}
+                    })
+                end
+            end
         end
     end)
 else
-    for i = 1, #sharedConfig.locations.duty do
-        lib.zones.box({
-            coords = sharedConfig.locations.duty[i],
-            size = vec3(2, 2, 2),
-            rotation = 0.0,
-            debug = config.polyDebug,
-            onEnter = function()
-                if QBX.PlayerData.job.type ~= 'leo' then return end
-                inPrompt = true
-                lib.showTextUI(locale(QBX.PlayerData.job.onduty and 'info.off_duty' or 'info.on_duty'))
-                uiPrompt('duty')
-            end,
-            onExit = function()
-                inPrompt = false
-                lib.hideTextUI()
+    for _, station in ipairs(sharedConfig.stations) do
+        if station.duty then
+            for _, dutyCoords in ipairs(station.duty) do
+                lib.zones.box({
+                    coords = dutyCoords,
+                    size = vec3(2, 2, 2),
+                    rotation = 0.0,
+                    debug = config.polyDebug,
+                    onEnter = function()
+                        if not hasStationAccess(station) then return end
+                        currentStation = station.id
+                        inPrompt = true
+                        lib.showTextUI(locale(QBX.PlayerData.job.onduty and 'info.off_duty' or 'info.on_duty'))
+                        uiPrompt('duty')
+                    end,
+                    onExit = function()
+                        inPrompt = false
+                        lib.hideTextUI()
+                    end
+                })
             end
-        })
+        end
     end
 end
 
 CreateThread(function()
-    -- Police Trash
-    for i = 1, #sharedConfig.locations.trash do
-        lib.zones.box({
-            coords = sharedConfig.locations.trash[i],
-            size = vec3(2, 2, 2),
-            rotation = 0.0,
-            debug = config.polyDebug,
-            onEnter = function()
-                if QBX.PlayerData.job.type ~= 'leo' or not QBX.PlayerData.job.onduty then return end
-                inTrash = true
-                inPrompt = true
-                lib.showTextUI(locale('info.trash_enter'))
-                uiPrompt('trash', i)
-            end,
-            onExit = function()
-                inTrash = false
-                inPrompt = false
-                lib.hideTextUI()
+    -- Iterate through all stations and create zones for each location type
+    for _, station in ipairs(sharedConfig.stations) do
+        -- Police Trash
+        if station.trash and #station.trash > 0 then
+            for i, trashCoords in ipairs(station.trash) do
+                lib.zones.box({
+                    coords = trashCoords,
+                    size = vec3(2, 2, 2),
+                    rotation = 0.0,
+                    debug = config.polyDebug,
+                    onEnter = function()
+                        if not hasStationAccess(station) or not QBX.PlayerData.job.onduty then return end
+                        currentStation = station.id
+                        inTrash = true
+                        inPrompt = true
+                        lib.showTextUI(locale('info.trash_enter'))
+                        uiPrompt('trash', i)
+                    end,
+                    onExit = function()
+                        inTrash = false
+                        inPrompt = false
+                        lib.hideTextUI()
+                    end
+                })
             end
-        })
-    end
+        end
 
-    -- Fingerprints
-    for i = 1, #sharedConfig.locations.fingerprint do
-        lib.zones.box({
-            coords = sharedConfig.locations.fingerprint[i],
-            size = vec3(2, 2, 2),
-            rotation = 0.0,
-            debug = config.polyDebug,
-            onEnter = function()
-                if QBX.PlayerData.job.type ~= 'leo' or not QBX.PlayerData.job.onduty then return end
-                inFingerprint = true
-                inPrompt = true
-                lib.showTextUI(locale('info.scan_fingerprint'))
-                uiPrompt('fingerprint')
-            end,
-            onExit = function()
-                inFingerprint = false
-                inPrompt = false
-                lib.hideTextUI()
+        -- Fingerprints
+        if station.fingerprint and #station.fingerprint > 0 then
+            for _, fingerprintCoords in ipairs(station.fingerprint) do
+                lib.zones.box({
+                    coords = fingerprintCoords,
+                    size = vec3(2, 2, 2),
+                    rotation = 0.0,
+                    debug = config.polyDebug,
+                    onEnter = function()
+                        if not hasStationAccess(station) or not QBX.PlayerData.job.onduty then return end
+                        currentStation = station.id
+                        inFingerprint = true
+                        inPrompt = true
+                        lib.showTextUI(locale('info.scan_fingerprint'))
+                        uiPrompt('fingerprint')
+                    end,
+                    onExit = function()
+                        inFingerprint = false
+                        inPrompt = false
+                        lib.hideTextUI()
+                    end
+                })
             end
-        })
-    end
+        end
 
-    -- Helicopter
-    for i = 1, #sharedConfig.locations.helicopter do
-        lib.zones.box({
-            coords = sharedConfig.locations.helicopter[i],
-            size = vec3(4, 4, 4),
-            rotation = 0.0,
-            debug = config.polyDebug,
-            onEnter = function()
-                if QBX.PlayerData.job.type ~= 'leo' or not QBX.PlayerData.job.onduty then return end
-                inHelicopter = true
-                inPrompt = true
-                uiPrompt('heli')
-                lib.showTextUI(locale(cache.vehicle and 'info.store_heli' or 'info.take_heli'))
-            end,
-            onExit = function()
-                inHelicopter = false
-                inPrompt = false
-                lib.hideTextUI()
+        -- Helicopter
+        if station.helicopter and #station.helicopter > 0 then
+            for _, heliCoords in ipairs(station.helicopter) do
+                lib.zones.box({
+                    coords = heliCoords,
+                    size = vec3(4, 4, 4),
+                    rotation = 0.0,
+                    debug = config.polyDebug,
+                    onEnter = function()
+                        if not hasStationAccess(station) or not QBX.PlayerData.job.onduty then return end
+                        currentStation = station.id
+                        inHelicopter = true
+                        inPrompt = true
+                        uiPrompt('heli')
+                        lib.showTextUI(locale(cache.vehicle and 'info.store_heli' or 'info.take_heli'))
+                    end,
+                    onExit = function()
+                        inHelicopter = false
+                        inPrompt = false
+                        lib.hideTextUI()
+                    end
+                })
             end
-        })
-    end
+        end
 
-    -- Police Impound
-    for i = 1, #sharedConfig.locations.impound do
-        lib.zones.box({
-            coords = sharedConfig.locations.impound[i],
-            size = vec3(2, 2, 2),
-            rotation = 0.0,
-            debug = config.polyDebug,
-            onEnter = function()
-                if QBX.PlayerData.job.type ~= 'leo' or not QBX.PlayerData.job.onduty then return end
-                inImpound = true
-                inPrompt = true
-                currentGarage = i
-                lib.showTextUI(locale(cache.vehicle and 'info.impound_veh' or 'menu.pol_impound'))
-                uiPrompt('impound')
-            end,
-            onExit = function()
-                inImpound = false
-                inPrompt = false
-                lib.hideTextUI()
-                currentGarage = 0
+        -- Police Impound
+        if station.impound and #station.impound > 0 then
+            for i, impoundCoords in ipairs(station.impound) do
+                lib.zones.box({
+                    coords = impoundCoords,
+                    size = vec3(2, 2, 2),
+                    rotation = 0.0,
+                    debug = config.polyDebug,
+                    onEnter = function()
+                        if not hasStationAccess(station) or not QBX.PlayerData.job.onduty then return end
+                        currentStation = station.id
+                        currentGarage = i
+                        inImpound = true
+                        inPrompt = true
+                        lib.showTextUI(locale(cache.vehicle and 'info.impound_veh' or 'menu.pol_impound'))
+                        uiPrompt('impound')
+                    end,
+                    onExit = function()
+                        inImpound = false
+                        inPrompt = false
+                        lib.hideTextUI()
+                        currentGarage = 0
+                    end
+                })
             end
-        })
-    end
+        end
 
-    -- Police Garage
-    for i = 1, #sharedConfig.locations.vehicle do
-        lib.zones.box({
-            coords = sharedConfig.locations.vehicle[i],
-            size = vec3(2, 2, 2),
-            rotation = 0.0,
-            debug = config.polyDebug,
-            onEnter = function()
-                if QBX.PlayerData.job.type ~= 'leo' or not QBX.PlayerData.job.onduty then return end
-                inGarage = true
-                inPrompt = true
-                currentGarage = i
-                lib.showTextUI(locale(cache.vehicle and 'info.store_veh' or 'info.grab_veh'))
-                uiPrompt('garage')
-            end,
-            onExit = function()
-                inGarage = false
-                inPrompt = false
-                lib.hideTextUI()
+        -- Police Garage
+        if station.vehicle and #station.vehicle > 0 then
+            for i, vehicleCoords in ipairs(station.vehicle) do
+                lib.zones.box({
+                    coords = vehicleCoords,
+                    size = vec3(2, 2, 2),
+                    rotation = 0.0,
+                    debug = config.polyDebug,
+                    onEnter = function()
+                        if not hasStationAccess(station) or not QBX.PlayerData.job.onduty then return end
+                        currentStation = station.id
+                        currentGarage = i
+                        inGarage = true
+                        inPrompt = true
+                        lib.showTextUI(locale(cache.vehicle and 'info.store_veh' or 'info.grab_veh'))
+                        uiPrompt('garage')
+                    end,
+                    onExit = function()
+                        inGarage = false
+                        inPrompt = false
+                        lib.hideTextUI()
+                        currentGarage = 0
+                    end
+                })
             end
-        })
+        end
     end
 end)

@@ -7,6 +7,29 @@ local updatingCops = false
 Plates = {}
 IsUsingXTPrison = GetResourceState('xt-prison'):find('start')
 
+-- Server-side station access validation
+local function hasStationAccess(src, station)
+    if not station then return false end
+
+    local player = exports.qbx_core:GetPlayer(src)
+    if not player then return false end
+
+    local playerJob = player.PlayerData.job
+    if not playerJob or playerJob.type ~= 'leo' then return false end
+
+    -- If station has no jobs restriction, allow all LEO jobs
+    if not station.jobs or #station.jobs == 0 then return true end
+
+    -- Check if player's job is in the allowed jobs list
+    for _, allowedJob in ipairs(station.jobs) do
+        if playerJob.name == allowedJob then
+            return true
+        end
+    end
+
+    return false
+end
+
 ---@param player Player
 ---@param minGrade? integer
 ---@return boolean?
@@ -194,11 +217,44 @@ RegisterNetEvent('police:server:policeAlert', function(text, camId, playerSource
     end
 end)
 
-RegisterNetEvent('police:server:TakeOutImpound', function(plate, garage)
+RegisterNetEvent('police:server:TakeOutImpound', function(plate, stationId, garageIndex)
     local src = tonumber(source)
     if not src then return end
     local playerCoords = GetEntityCoords(GetPlayerPed(src))
-    if #(playerCoords - sharedConfig.locations.impound[garage]) > 10.0 then return end
+
+    -- Find the station and validate location
+    local foundStation = nil
+    for _, station in ipairs(sharedConfig.stations) do
+        if station.id == stationId and station.impound and station.impound[garageIndex] then
+            local impoundCoords = station.impound[garageIndex]
+            if #(playerCoords - impoundCoords) <= 10.0 then
+                foundStation = station
+                break
+            end
+        end
+    end
+
+    -- Fallback: check all stations for nearby impound (backwards compatibility)
+    if not foundStation then
+        for _, station in ipairs(sharedConfig.stations) do
+            if station.impound then
+                for _, impoundCoords in ipairs(station.impound) do
+                    if #(playerCoords - impoundCoords) <= 10.0 then
+                        foundStation = station
+                        break
+                    end
+                end
+            end
+            if foundStation then break end
+        end
+    end
+
+    if not foundStation then return end
+
+    -- Validate job access to station
+    if not hasStationAccess(src, foundStation) then
+        return exports.qbx_core:Notify(src, locale('error.no_access') or 'You do not have access to this station', 'error')
+    end
 
     Unimpound(plate)
     exports.qbx_core:Notify(src, locale('success.impound_vehicle_removed'), 'success')
@@ -589,18 +645,29 @@ AddEventHandler('onServerResourceStart', function(resource)
         end
     end
 
-    for i = 1, #sharedConfig.locations.trash do
-        exports.ox_inventory:RegisterStash(('policetrash_%s'):format(i), 'Police Trash', 300, 4000000, nil, jobs,
-            sharedConfig.locations.trash[i])
+    -- Register trash stashes for all stations
+    for _, station in ipairs(sharedConfig.stations) do
+        if station.trash then
+            for i, trashCoords in ipairs(station.trash) do
+                local stashId = ('policetrash_%s_%s'):format(station.id, i)
+                exports.ox_inventory:RegisterStash(stashId, 'Police Trash', 300, 4000000, nil, jobs, trashCoords)
+            end
+        end
     end
+
     exports.ox_inventory:RegisterStash('policelocker', 'Police Locker', 30, 100000, true)
 end)
 
 -- Threads
 CreateThread(function()
     Wait(1000)
-    for i = 1, #sharedConfig.locations.trash do
-        exports.ox_inventory:ClearInventory(('policetrash_%s'):format(i))
+    -- Clear trash inventories for all stations
+    for _, station in ipairs(sharedConfig.stations) do
+        if station.trash then
+            for i, _ in ipairs(station.trash) do
+                exports.ox_inventory:ClearInventory(('policetrash_%s_%s'):format(station.id, i))
+            end
+        end
     end
     while true do
         Wait(1000 * 60 * 10)

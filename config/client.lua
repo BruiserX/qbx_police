@@ -1,6 +1,6 @@
 return {
-    useTarget = false,
-    polyDebug = false,
+    useTarget = true,
+    polyDebug = true,
 
     handcuffItems = 'handcuffs',
     policeHelicopter = 'polmav',
